@@ -1,0 +1,308 @@
+
+// This cBot will use MACD abnd StochasticOscillator to generate trades
+
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using cAlgo.Indicators;
+
+namespace cAlgo
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class MSO : Robot
+    {
+        [Parameter("Source")]
+        public DataSeries Source { get; set; }
+
+        ////////// START StocOsc
+        [Parameter("K-Periods", DefaultValue = 16)]
+        public int kPeriods { get; set; }
+
+        [Parameter("K-Slowing", DefaultValue = 5)]
+        public int kSlowing { get; set; }
+        ////////// END StocOsc
+
+        [Parameter("D-Periods", DefaultValue = 9)]
+        public int dPeriods { get; set; }
+
+        [Parameter("MA Type")]
+        public MovingAverageType MAType { get; set; }
+
+        ////////// START MACD
+        [Parameter("Long MA", DefaultValue = 27)]
+        public int longMA { get; set; }
+
+        [Parameter("Short MA", DefaultValue = 6)]
+        public int shortMA { get; set; }
+
+        ////////// ATR
+        private AverageTrueRange iATR;
+        [Parameter(DefaultValue = 14)]
+        public int ATR_Periods { get; set; }
+
+        [Parameter("MA Type", DefaultValue = MovingAverageType.Exponential)]
+        public MovingAverageType ATR_MAType { get; set; }
+        ////////// ATR
+
+
+        [Parameter("Order Step Size", DefaultValue = 5, Step = 5)]
+        public int Trailing { get; set; }
+
+        [Parameter("Number of Orders", DefaultValue = 5, Step = 5)]
+        public int iTrailingOrders { get; set; }
+
+        [Parameter("Take Profit", DefaultValue = 1.0, Step = 0.5)]
+        public double TakeProfit { get; set; }
+
+        [Parameter("Stop Loss", DefaultValue = 1.0, Step = 0.5)]
+        public double StopLoss { get; set; }
+
+        [Parameter("Max Stop Loss", DefaultValue = 50.0, Step = 10.0)]
+        public double MaxStopLoss { get; set; }
+
+        [Parameter("Max Take Profit", DefaultValue = 50.0, Step = 10.0)]
+        public double MaxTP { get; set; }
+
+        [Parameter("Quantity (Lots)", DefaultValue = 0.01, MinValue = 0.01, Step = 0.01)]
+        public double Quantity { get; set; }
+
+        [Parameter("SignalHolding", DefaultValue = 5)]
+        public int iSignalHolding { get; set; }
+
+        private StochasticOscillator StocOsc;
+        private MacdCrossOver iMACD;
+        bool bLongSO;
+        bool bShortSO;
+        bool bLongMACD;
+        bool bShortMACD;
+        int cTickLongSO = 0;
+        int cTickLongMACD = 0;
+        int cTickShortSO = 0;
+        int cTickShortMACD = 0;
+        int cycle = 0;
+        string sLabel = "StochMACD_";
+
+        protected override void OnStart()
+        {
+            StocOsc = Indicators.StochasticOscillator(kPeriods, kSlowing, dPeriods, MAType);
+            iMACD = Indicators.MacdCrossOver(longMA, shortMA, dPeriods);
+            iATR = Indicators.AverageTrueRange(ATR_Periods, ATR_MAType);
+
+        }
+
+        protected override void OnTick()
+        {
+        }
+        protected override void OnBar()
+        {
+            CheckPnL();
+
+            CheckStrategyConditions();
+
+            CheckSignalCounter();
+
+            OrderUp();
+        }
+
+        private void Close(TradeType tradeType)
+        {
+            foreach (var position in Positions.FindAll(sLabel, Symbol, tradeType))
+                ClosePosition(position);
+
+
+            foreach (PendingOrder o in PendingOrders)
+            {
+                if (o.Label == sLabel && o.SymbolCode == Symbol.Code)
+                {
+                    CancelPendingOrder(o);
+                }
+            }
+        }
+
+        private double notFactor;
+
+        private void Open(TradeType tradeType)
+        {
+            var position = Positions.Find(sLabel, Symbol, tradeType);
+            var z = 1;
+            //Math.Min(4, Math.Max(1, Math.Round(Account.Balance / 1000, 0)));
+            var volumeInUnits = Symbol.QuantityToVolume(Quantity * z);
+            notFactor = z;
+            var vATR = Math.Round(iATR.Result.LastValue / Symbol.PipSize, 0);
+
+            if (position == null)
+            {
+                ExecuteMarketOrder(tradeType, Symbol, volumeInUnits, sLabel, StopLoss * vATR, TakeProfit * vATR, null, "Init");
+                Print("Pips:{0} | ATR:{1}", Symbol.PipSize, vATR);
+                //StopLoss * vATR, TakeProfit * vATR);
+                for (var x = 1; x < iTrailingOrders; x++)
+                {
+                    if (bLongSO && bLongMACD)
+                    {
+                        PlaceStopOrder(tradeType, Symbol, volumeInUnits, Symbol.Ask + Trailing * Symbol.PipSize * x, sLabel, StopLoss * vATR - Trailing * x, TakeProfit * vATR - Trailing * x, null, sLabel + "_" + Symbol.Code + "_" + x);
+                        //, StopLoss * vATR - Trailing * x, TakeProfit * vATR);
+                        Print("Order Placed SL: {0} TP: {1}", StopLoss * vATR - Trailing * Symbol.PipSize * x, TakeProfit * vATR);
+                    }
+                    if (bShortSO && bShortMACD)
+                    {
+                        PlaceStopOrder(tradeType, Symbol, volumeInUnits, Symbol.Ask - Trailing * Symbol.PipSize * x, sLabel, StopLoss * vATR - Trailing * x, TakeProfit * vATR - Trailing * x, null, sLabel + "_" + Symbol.Code + "_" + x);
+                        //, StopLoss * vATR - Trailing * x
+                        Print("Order Placed SL: {0} TP: {1}", StopLoss * vATR - Trailing * Symbol.PipSize * x, TakeProfit * vATR);
+                    }
+                }
+                cycle++;
+            }
+            Print("Creating {0}, Risk: {1}, Reward: {2}, SignalHolding: {3}", Symbol.Code + tradeType, StopLoss * vATR, TakeProfit * vATR, Math.Max(Math.Max(cTickLongMACD, cTickLongSO), Math.Max(cTickShortMACD, cTickShortSO)));
+
+        }
+
+        private void CheckStrategyConditions()
+        {
+            //Print("**STRATEGY CONDITIONS**");
+            if (StocOsc.PercentK.HasCrossedAbove(StocOsc.PercentD, 0) && StocOsc.PercentK.LastValue < 20)
+            {
+                bLongSO = true;
+                bShortSO = false;
+
+            }
+            else if (StocOsc.PercentK.HasCrossedBelow(StocOsc.PercentD, 0) && StocOsc.PercentK.LastValue > 80)
+            {
+                bShortSO = true;
+                bLongSO = false;
+            }
+            else if (iMACD.MACD.HasCrossedAbove(iMACD.Signal, 0) && iMACD.MACD.IsRising())
+            {
+                bLongMACD = true;
+                bShortMACD = false;
+            }
+            else if (iMACD.MACD.HasCrossedBelow(iMACD.Signal, 0) && iMACD.MACD.IsFalling())
+            {
+                bShortMACD = true;
+                bLongSO = false;
+            }
+        }
+
+        private void CheckSignalCounter()
+        {
+            //Print("**CHECK SIGNAL COUNTER**");
+            if (bLongMACD)
+            {
+                cTickLongMACD++;
+            }
+            if (bShortMACD)
+            {
+                cTickShortMACD++;
+            }
+            else if (bLongSO)
+            {
+                cTickLongSO++;
+            }
+            else if (bShortSO)
+            {
+                cTickShortSO++;
+            }
+            Print("Long Signals: {0} and {1}", cTickLongMACD, cTickLongSO);
+            Print("Short Signals: {0} and {1}", cTickShortMACD, cTickShortSO);
+            //Reset counter after X periods
+            if (cTickLongMACD >= iSignalHolding)
+            {
+                cTickLongMACD = 0;
+                bLongMACD = false;
+            }
+            else if (cTickShortMACD >= iSignalHolding)
+            {
+                cTickShortMACD = 0;
+                bShortMACD = false;
+            }
+            else if (cTickLongSO >= iSignalHolding)
+            {
+                cTickLongSO = 0;
+                bLongSO = false;
+            }
+            else if (cTickShortSO >= iSignalHolding)
+            {
+                cTickShortSO = 0;
+                bShortSO = false;
+            }
+            Print("MACD: Short?" + bShortMACD + "  Long?" + bLongMACD);
+            Print("Stoc: Short?" + bShortSO + "  Long?" + bLongSO);
+        }
+
+        private void OrderUp()
+        {
+            //Print("**ORDER UP**");
+            if (bLongSO && bLongMACD)
+            {
+                Close(TradeType.Sell);
+                Open(TradeType.Buy);
+                bLongSO = false;
+                bLongMACD = false;
+                cTickLongMACD = 0;
+                cTickLongSO = 0;
+                cTickShortMACD = 0;
+                cTickShortSO = 0;
+                Print("Order: Buy");
+                // | Switches: MACD: {0}, SO: {1} | Ticks: MACD: {2}, SO: {3}", bLongMACD, bLongSO, cTickMACD, cTickSO);
+            }
+            else if (bShortSO && bShortMACD)
+            {
+                Close(TradeType.Buy);
+                Open(TradeType.Sell);
+                bLongSO = false;
+                bLongMACD = false;
+                cTickLongMACD = 0;
+                cTickLongSO = 0;
+                cTickShortMACD = 0;
+                cTickShortSO = 0;
+                Print("Order: Sell");
+                // | Switches: MACD: {0}, SO: {1} | Ticks: MACD: {2}, SO: {3}", bLongMACD, bLongSO, cTickMACD, cTickSO);
+            }
+        }
+        double profit;
+        TradeType buyOrSell;
+        private void CheckPnL()
+        {
+            foreach (var p in Positions.FindAll(sLabel, Symbol))
+            {
+                var prof = p.NetProfit;
+
+                profit = prof++;
+                buyOrSell = p.TradeType;
+            }
+
+            if (profit < -1 * MaxStopLoss)
+            {
+                Close(buyOrSell);
+            }
+
+            if (profit >= 1 * MaxTP)
+            {
+                Close(buyOrSell);
+            }
+        }
+    }
+
+
+}
+
+/*
+ if (p.Comment == "Init")
+                {
+                    if (p.NetProfit > 0)
+                        return;
+                    else if (p.NetProfit < p.TakeProfit * -1)
+                    {
+                        Close(p.TradeType);
+                        foreach (PendingOrder o in PendingOrders)
+                        {
+                            if (o.TradeType == p.TradeType && o.Label == sLabel && o.SymbolCode == Symbol.Code)
+                            {
+                                CancelPendingOrder(o);
+                            }
+                        }
+
+                    }
+                }
+                */

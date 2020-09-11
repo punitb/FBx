@@ -1,0 +1,66 @@
+using System;
+using cAlgo.API;
+using Telegram.Bot;
+using Telegram.Bot.Args;
+using Telegram.Bot.Types.Enums;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.FullAccess)]
+    public class TelegramBot : Robot
+    {
+        [Parameter("Token", DefaultValue = "973354600:AAGd_KBIiNCr6KC2Y9jkAuWXGGR1PV5L064", Group = "Telegram Notifications")]
+        public string Token { get; set; }
+
+        [Parameter("Chat ID", DefaultValue = "-374452996", Group = "Telegram Notifications")]
+        public string ChatId { get; set; }
+
+        public Telegram Telegram { get; private set; }
+
+        public DateTime StartUpDate { get; set; }
+
+        public string NewSignal { get; set; }
+
+        protected override void OnStart()
+        {
+            StartUpDate = DateTime.UtcNow;
+
+            Telegram = new Telegram(Token, ChatId);
+
+            Telegram.Bot.OnMessage += OnMessageReceived;
+
+            Telegram.Bot.StartReceiving(Array.Empty<UpdateType>());
+
+            Telegram.SendMessage("Bot started!");
+        }
+
+        protected override void OnTick()
+        {
+        }
+
+        protected override void OnStop()
+        {
+            Telegram.Bot.OnMessage -= OnMessageReceived;
+
+            Telegram.SendMessage("Bot stopped!");
+        }
+
+        private void OnMessageReceived(object sender, MessageEventArgs e)
+        {
+            // If it's somehow null, message type isn't text and it's not the channel you wanted, dismiss the message.
+            if (e == null || e.Message.Type != MessageType.Text || e.Message.Chat.Id != Telegram.ChatId)
+            {
+                return;
+            }
+
+            // If the message is sent before startup, dismiss it.
+            if (e.Message.Date < StartUpDate)
+            {
+                return;
+            }
+
+            NewSignal = e.Message.Text;
+            Print(NewSignal);
+        }
+    }
+}

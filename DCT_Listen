@@ -38,7 +38,7 @@ namespace cAlgo.Robots
         [Parameter("Debug Mode", DefaultValue = true)]
         public bool DebugMode { get; set; }
 
-        [Parameter("Token", DefaultValue = "1258254617:AAHgJTpoWsV7VEuunmp3DF8yGYX3hhgxbEA", Group = "Telegram")]
+        [Parameter("Token", DefaultValue = "___BOT_TOKEN___", Group = "Telegram")]
         public string Token { get; set; }
 
         [Parameter("Chat ID", DefaultValue = "-374452996", Group = "Telegram")]

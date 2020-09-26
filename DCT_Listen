@@ -1,0 +1,294 @@
+using System;
+using System.Linq;
+using System.Collections;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using cAlgo.Indicators;
+using System.Collections.Generic;
+
+using Telegram.Bot;
+using Telegram.Bot.Args;
+using Telegram.Bot.Types.Enums;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.FullAccess)]
+    public class DCT_Listen : Robot
+    {
+
+        [Parameter("Label ID", DefaultValue = "DCT")]
+        public string LabelPrefix { get; set; }
+
+        [Parameter("Risk Max (%)", DefaultValue = 1, Step = 0.05)]
+        public double Risk_Max { get; set; }
+
+        [Parameter("Risk Min (%)", DefaultValue = 0.25, Step = 0.05)]
+        public double Risk_Min { get; set; }
+
+        [Parameter("R-r Ratio", DefaultValue = 1, Step = 0.05)]
+        public double RrRatio { get; set; }
+
+        [Parameter("ATR Multiple", DefaultValue = 2, Step = 0.5)]
+        public double mATR { get; set; }
+
+        [Parameter("Risk Cover (%)", DefaultValue = 50, Step = 5)]
+        public double Risk_Cover { get; set; }
+
+        [Parameter("Debug Mode", DefaultValue = true)]
+        public bool DebugMode { get; set; }
+
+        [Parameter("Token", DefaultValue = "1258254617:AAHgJTpoWsV7VEuunmp3DF8yGYX3hhgxbEA", Group = "Telegram")]
+        public string Token { get; set; }
+
+        [Parameter("Chat ID", DefaultValue = "-374452996", Group = "Telegram")]
+        public string ChatId { get; set; }
+
+        public Telegram Telegram { get; private set; }
+
+        public DateTime StartUpDate { get; set; }
+
+        public string NewSignal { get; set; }
+
+        public bool UseTrailingStop = false;
+
+        double StopLoss;
+        double BadVolumeSize = 10000;
+
+        string _asset, _label;
+        TradeType _direction;
+        Symbol _symbol;
+        string _comment;
+        double _volume;
+
+        ArrayList Balances;
+        double EquityPeak, EquityTrough;
+        double Profits, Losses, avgProfit, avgLoss;
+        int countWin, countLoss;
+
+        Dictionary<string, double> dictEaR;
+
+        protected override void OnStart()
+        {
+            StartUpDate = DateTime.UtcNow;
+
+            Telegram = new Telegram(Token, ChatId);
+            Telegram.Bot.OnMessage += OnMessageReceived;
+            Telegram.Bot.StartReceiving(Array.Empty<UpdateType>());
+            Print("Bot started!");
+            Balances = new ArrayList();
+            //CalcStats();
+            Positions.Closed += OnPositionsClosed;
+            dictEaR = new Dictionary<string, double>();
+        }
+
+        void OnPositionsClosed(PositionClosedEventArgs obj)
+        {
+            UpdateTradeStats(obj.Position);
+        }
+
+        protected override void OnStop()
+        {
+            Telegram.Bot.OnMessage -= OnMessageReceived;
+            Print("Bot stopped!");
+        }
+
+        public void OnMessageReceived(object sender, MessageEventArgs e)
+        {
+            // If it's somehow null, message type isn't text and it's not the channel you wanted, dismiss the message.
+            Print(e.Message.Text);
+            if (e == null || e.Message.Type != MessageType.Text || e.Message.Chat.Id != Telegram.ChatId)
+                return;
+
+            if (e.Message.From.Username != "punitbharadwa")
+                return;
+
+            // If the message is sent before startup, dismiss it.
+            if (e.Message.Date < StartUpDate)
+                return;
+
+            NewSignal = e.Message.Text;
+
+            Print(NewSignal);
+            var Signal = NewSignal.Split(' ');
+            //for (var i = 0; i <= Signal.GetUpperBound(0); i++)
+            //    Print("Signal {0}: {1}", i, Signal[i]);
+
+            //Print("Signal Count: " + Signal.GetUpperBound(0));
+            if (Signal.GetUpperBound(0) < 6)
+                return;
+
+                        /*if (Signal[3].ToUpper() == "HOUR")
+                return;*/
+
+_asset = Signal[0];
+            _symbol = Symbols.GetSymbol(_asset);
+
+            if (Signal.Last().ToUpper() == "UP")
+            {
+                _direction = TradeType.Buy;
+            }
+            else if (Signal.Last().ToUpper() == "DN")
+            {
+                _direction = TradeType.Sell;
+            }
+
+            _label = string.Format("{0}", LabelPrefix);
+            double SD = StdDev(Signal[0], TimeFrame.Hour, 60);
+            double swing = LastSwing(TimeFrame.Minute15, _symbol, _direction, 5);
+            StopLoss = (swing + 1 * SD) / _symbol.PipSize;
+            //StopLoss = GetOrCalcStopLoss(_label, GetATR(_symbol, TimeFrame.Daily, mATR));
+            Print("StopLoss: {0}\tSwing: {1}\tSD: {2}", StopLoss, swing, SD);
+            double Risk = Signal[3].ToUpper() == "HOUR" ? Risk_Min : EquityOsc(Risk_Max, Risk_Min, EquityPeak, EquityTrough, Account.Equity - 1000);
+            _volume = GetOrderVolume(StopLoss, Risk, TradeCounter(_label, _asset), _symbol);
+            _comment = string.Format("{0}_{1}_{2}_{3}_{4}_{5}", TradeCounter(_label, _asset), _direction, Signal[3], Signal[0], Signal[6], _volume);
+            ExecuteMarketOrder(_direction, _symbol.Name, _volume, _label, StopLoss, null, _comment, UseTrailingStop);
+            Print("{0}: {1}", LastResult.Position.SymbolName, StopLoss);
+        }
+
+
+        private double LastSwing(TimeFrame tf, Symbol s, TradeType dir, int Periods)
+        {
+            Bars b = MarketData.GetBars(tf, s.Name);
+            Swing swing = Indicators.GetIndicator<Swing>(b, Periods, false, 20, true);
+            double lastswing = dir == TradeType.Buy ? swing.Lows.Last(0) : swing.Highs.Last(0);
+            return Math.Abs(b.ClosePrices.Last(0) - lastswing);
+        }
+
+        private double StdDev(string Asset, TimeFrame tf, int Periods)
+        {
+            StandardDeviation sd = Indicators.StandardDeviation(MarketData.GetBars(tf, Asset).ClosePrices, Periods, MovingAverageType.Simple);
+            double _stddev = sd.Result.LastValue;
+            return _stddev;
+        }
+
+        private void CheckSL(Position p)
+        {
+            if (!p.StopLoss.HasValue)
+            {
+                Print("No Stop Loss set. Setting to 2x Hourly SD");
+                Symbol s = Symbols.GetSymbol(p.SymbolName);
+                p.ModifyStopLossPips(StdDev(p.SymbolName, TimeFrame.Hour, 2) / s.PipSize);
+                return;
+            }
+        }
+
+        private void CalcStats()
+        {
+            Profits = 0.0;
+            Losses = 0.0;
+            countWin = 0;
+            countLoss = 0;
+            EquityPeak = 0.0;
+            EquityTrough = 0.0;
+            double sumEq = 0.0;
+            double prevBalance = 0;
+            foreach (HistoricalTrade h in History.FindAll(LabelPrefix))
+            {
+                if (h.NetProfit > 0)
+                {
+                    Profits += h.NetProfit;
+                    countWin++;
+                }
+                else if (h.NetProfit < 0)
+                {
+                    Losses += h.NetProfit;
+                    countLoss++;
+                }
+                Balances.Add(prevBalance + h.NetProfit);
+            }
+            EquityPeak = (double)Balances.ToArray().Max();
+
+            Print("equity calcs");
+            for (var i = 1; i < 20; i++)
+                sumEq += (double)(Balances[Balances.Count - i]);
+
+            EquityTrough = sumEq / 20;
+            avgProfit = Profits / countWin;
+            avgLoss = Losses / countLoss;
+            Print("Eq Peak: {0}", EquityPeak);
+            Print("Eq Trough: {0}", EquityTrough);
+            Print("Eq prev Bal: {0}", prevBalance);
+            Print("Sum Profits: {0}\tLosses: {1}", Profits, Losses);
+            Print("Counts Wins: {0}\tLosses: {1}", countWin, countLoss);
+        }
+
+        private void UpdateTradeStats(Position p)
+        {
+            if (p.Label == LabelPrefix)
+            {
+                if (p.NetProfit > 0)
+                {
+                    Profits += p.NetProfit;
+                    countWin++;
+                    avgProfit = Profits / countWin;
+                }
+                else if (p.NetProfit < 0)
+                {
+                    Losses += p.NetProfit;
+                    countLoss++;
+                    avgLoss = Losses / countLoss;
+                }
+
+                EquityPeak = Math.Max(Account.Equity + p.NetProfit, EquityPeak);
+                EquityTrough = Math.Min(Account.Equity + p.NetProfit, EquityTrough);
+            }
+        }
+
+        public double EquityOsc(double Risk_Max, double Risk_Min, double Peak, double Trough, double equity)
+        {
+            double Value = (equity - Trough) / (Peak - Trough);
+            if (Value.ToString() == "NaN")
+            {
+                return Risk_Min;
+            }
+            else
+            {
+                return Math.Max(Risk_Min, Math.Min(Risk_Max, (Risk_Max * Value)));
+            }
+        }
+
+        private int TradeCounter(string Label, string Asset)
+        {
+            var counter = Positions.FindAll(Label, Asset).Count();
+            return counter;
+        }
+
+        private double GetOrCalcStopLoss(string label, double ATR_Stop)
+        {
+            var FinalStopLoss = 0.0;
+            if (Positions.FindAll(label).Count() > 0)
+            {
+                Position pos = Positions.Find(label);
+                if (pos.StopLoss.HasValue)
+                {
+                    var s = Symbols.GetSymbol(pos.SymbolName);
+                    var CurrentPrice = MarketData.GetBars(TimeFrame.Minute, s.Name).ClosePrices.LastValue;
+                    var StopLossPrice = pos.StopLoss.Value;
+                    FinalStopLoss = CurrentPrice - StopLossPrice;
+                    FinalStopLoss = Math.Abs(FinalStopLoss) / s.PipSize;
+                }
+            }
+            else
+            {
+                FinalStopLoss = ATR_Stop;
+            }
+
+            return Math.Round(FinalStopLoss, 1);
+        }
+
+        private double GetATR(Symbol s, TimeFrame tf, double mATR)
+        {
+            double atr = Indicators.AverageTrueRange(MarketData.GetBars(tf, s.Name), 20, MovingAverageType.Simple).Result.LastValue;
+            return Math.Round(mATR * atr / s.PipSize, 1);
+        }
+        private double GetOrderVolume(double StopLoss, double Risk, int NoOfTrades, Symbol s)
+        {
+            double risk_tranche = Risk * (100 - NoOfTrades) / NoOfTrades;
+            double _OrderVolume = ((Account.Balance * risk_tranche / 100) / StopLoss / s.PipValue);
+            double FinalVolume = Math.Max(s.VolumeInUnitsMin * 3, Math.Min(BadVolumeSize, _OrderVolume));
+            return s.NormalizeVolumeInUnits(FinalVolume);
+        }
+
+    }
+}

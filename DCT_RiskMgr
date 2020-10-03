@@ -17,6 +17,15 @@ namespace cAlgo.Robots
         [Parameter("Label ID", DefaultValue = "DCT")]
         public string LabelPrefix { get; set; }
 
+        [Parameter("Swing Periods", DefaultValue = 5, Step = 1)]
+        public int SwingPeriods { get; set; }
+
+        [Parameter("Vol Periods", DefaultValue = 20, Step = 1)]
+        public int VolPeriods { get; set; }
+
+        [Parameter("Vol Factor", DefaultValue = 2, Step = 0.25)]
+        public double Factor { get; set; }
+
         [Parameter("Risk Max (%)", DefaultValue = 1, Step = 0.05)]
         public double Risk_Max { get; set; }
 
@@ -38,28 +47,27 @@ namespace cAlgo.Robots
         Symbol Asset;
         double totalValue, totalEaR;
         double BreakevenVolume;
-        double BadVolumeSize = 10000;
+        double BadVolumeSize = 20000;
 
         ArrayList Balances;
         double EquityPeak, EquityTrough;
         double Profits, Losses, avgProfit, avgLoss;
         int countWin, countLoss;
-        TimeSpan TotalDuration;
+
         long AvgDuration_Ticks;
         double Q3_PnL;
         Dictionary<string, double> dictEaR;
+        Dictionary<string, SwingSD> dictMktData;
+
+        double s_lo, s_hi;
 
         protected override void OnStart()
         {
-            Positions.Closed += OnPositionsClosed;
             dictEaR = new Dictionary<string, double>();
+            dictMktData = new Dictionary<string, SwingSD>();
             Balances = new ArrayList();
+            //if (Positions.FindAll(LabelPrefix).Count() > 0)
             CalcStats();
-        }
-
-        void OnPositionsClosed(PositionClosedEventArgs obj)
-        {
-            UpdateTradeStats(obj.Position);
         }
 
         protected override void OnBar()
@@ -67,24 +75,32 @@ namespace cAlgo.Robots
             if (Positions.FindAll(LabelPrefix).Count() > 0)
             {
                 FilterTrades(LabelPrefix);
-                Print("Avg Trade Duration (1/3): {0} Hours", Math.Round(TimeSpan.FromTicks(AvgDuration_Ticks).TotalHours, 2));
+                Print("Avg Trade Duration (1/3): {0:F2} Hours", TimeSpan.FromTicks(AvgDuration_Ticks).Hours);
 
                 foreach (Position pos in Positions.FindAll(LabelPrefix))
                 {
-                    CheckSL(pos);
+                    // LOCALISED VARS
                     Asset = Symbols.GetSymbol(pos.SymbolName);
                     BuyOrSell = pos.TradeType == TradeType.Buy ? 1 : -1;
                     double OrigVolume = double.Parse(pos.Comment.Split('_').Last());
-                    if (pos.StopLoss.HasValue)
+
+                    if (!dictMktData.ContainsKey(pos.SymbolName))
                     {
-                        //Print("=== INITIAL LOSS ===");
-                        CloseHalf(pos, Asset, avgProfit, OrigVolume);
-                        //Print("=== INITIAL TP ===");
-                        BreakevenTrade(pos, 2, OrigVolume);
-                        //Print("=== FRRE LOADER CHECK ===");
-                        TimeChecks(pos, Asset, AvgDuration_Ticks, Q3_PnL);
+                        Bars b = MarketData.GetBars(TimeFrame.Minute15, pos.SymbolName);
+                        SwingSD newSwing = Indicators.GetIndicator<SwingSD>(b, 5, false, 20, 1.5, false);
+                        dictMktData.Add(pos.SymbolName, newSwing);
                     }
+
+                    CheckUpdateSL(Asset, pos, dictMktData);
+
+                    CloseHalf(pos, Asset, avgProfit, OrigVolume);
+
+                    BreakevenTrade(pos, 2, OrigVolume);
+
+                    TimeChecks(pos, Asset, AvgDuration_Ticks, Q3_PnL);
+
                     EquityAtRisk(dictEaR, pos.SymbolName, pos, Asset);
+
                     counter++;
                 }
                 PrintRisk();
@@ -99,9 +115,11 @@ namespace cAlgo.Robots
             countLoss = 0;
             EquityPeak = 0.0;
             EquityTrough = 0.0;
+            long sumDuration_Ticks = 0;
             double sumEq = 0.0;
             double prevBalance = 0;
-            TotalDuration = new TimeSpan(0);
+            double sum_sd = 0.0;
+            double sum_sortino_sd = 0.0;
             foreach (HistoricalTrade h in History.FindAll(LabelPrefix))
             {
                 if (h.NetProfit > 0)
@@ -114,50 +132,45 @@ namespace cAlgo.Robots
                     Losses += h.NetProfit;
                     countLoss++;
                 }
-                TotalDuration += h.ClosingTime - h.EntryTime;
                 Balances.Add(prevBalance + h.NetProfit);
-
+                sumDuration_Ticks += (h.ClosingTime - h.EntryTime).Ticks;
             }
-            AvgDuration_Ticks = (long)Math.Round((double)(TotalDuration.Ticks / (countWin + countLoss)), 0);
-
+            AvgDuration_Ticks = sumDuration_Ticks / (countWin + countLoss) / 2;
+            AvgDuration_Ticks /= 2;
             EquityPeak = (double)Balances.ToArray().Max();
 
             Print("equity calcs");
-            for (var i = 1; i < 20; i++)
-                sumEq += (double)(Balances[Balances.Count - i]);
+            if (Balances.Count > 20)
+                for (var i = 1; i < 20; i++)
+                    sumEq += (double)(Balances[Balances.Count - i]);
 
+            double avgTotal = (avgProfit + avgLoss) / (countWin + countLoss);
+            foreach (HistoricalTrade h in History.FindAll(LabelPrefix))
+            {
+                sum_sd += Math.Pow(h.NetProfit - avgTotal, 2.0);
+                sum_sortino_sd += Math.Pow(Math.Max(h.NetProfit, 0) - avgTotal, 2.0);
+            }
+
+            double sd = Math.Sqrt(sum_sd / (countWin + countLoss));
+            double sortino_sd = Math.Sqrt(sum_sortino_sd / (countWin + countLoss));
+            double GE = (avgProfit * countWin + avgLoss * countLoss) / (countWin + countLoss);
+            double totaltrades = countWin + countLoss;
+            double winrate = countWin / (totaltrades);
             EquityTrough = sumEq / 20;
-            double pureEquityTrough = (double)Balances.ToArray().Min();
             avgProfit = Profits / countWin;
             avgLoss = Losses / countLoss;
-            double GE = (countWin * avgProfit + countLoss * avgLoss) / (countWin + countLoss);
-            Print("Eq Peak: {0} Abs: {1}", EquityPeak, pureEquityTrough);
+            Print("Eq Peak: {0}", EquityPeak);
             Print("Eq Trough: {0}", EquityTrough);
             Print("Eq prev Bal: {0}", prevBalance);
-            Print("Avg Profits: {0:F2}\tLosses: {1:F2}", avgProfit, avgLoss);
-            Print("Sum Profits: {0:F0}\tLosses: {1:F0}", Profits, Losses);
-            Print("Counts Wins: {0}\tLosses: {1}", countWin, countLoss);
-            Print("GE: {0:F2}\tPF: {1:F2}", GE, Math.Abs(Profits / Losses));
+            Print("Avg Trade Duration: {0:F2}", TimeSpan.FromTicks(AvgDuration_Ticks).Hours);
+            Print("Sum Profits: {0}\tLosses: {1}", Profits, Losses);
+            Print("Counts Wins: {0}\tLosses: {1}\tWin Rate: {2:P2}\t Total:{3}", countWin, countLoss, winrate, totaltrades);
+            Print("GE: {0:F2}\tGPR: {1:F2}", GE, Math.Abs(Profits / Losses));
+            Print("Vol: {0:F2}\t-ve Vol: {1}", sd, sortino_sd);
+            Print("Sharpe: {0:F2} Sortino: {1:F2}", GE / sd, GE / sortino_sd);
+            Print("Score: {0}", (GE / sd) * (Profits / Losses));
         }
 
-        private void UpdateTradeStats(Position p)
-        {
-            if (p.NetProfit > 0)
-            {
-                Profits += p.NetProfit;
-                countWin++;
-                avgProfit = Profits / countWin;
-            }
-            else if (p.NetProfit < 0)
-            {
-                Losses += p.NetProfit;
-                countLoss++;
-                avgLoss = Losses / countLoss;
-            }
-            AvgDuration_Ticks = AvgDuration_Ticks + (DateTime.Now.AddSeconds(5).Ticks - p.EntryTime.Ticks) / 3;
-            EquityPeak = Math.Max(Account.Equity + p.NetProfit, EquityPeak);
-            EquityTrough = Math.Min(Account.Equity + p.NetProfit, EquityTrough);
-        }
 
         private void PrintRisk()
         {
@@ -173,13 +186,29 @@ namespace cAlgo.Robots
             dictEaR.Clear();
         }
 
-        private void CheckSL(Position p)
+        private void CheckUpdateSL(Symbol s, Position p, Dictionary<string, SwingSD> Dict)
         {
             if (!p.StopLoss.HasValue)
             {
                 Print("No Stop Loss set. Setting to 2x DailyATR");
-                p.ModifyStopLossPips(GetATR(Symbols.GetSymbol(p.SymbolName), TimeFrame.Daily, 2));
+
+                Bars b = MarketData.GetBars(TimeFrame.Hour, p.SymbolName);
+                p.ModifyStopLossPips(GetSD(Symbols.GetSymbol(p.SymbolName), b.ClosePrices, VolPeriods, Factor));
                 return;
+            }
+            else if (p.NetProfit > 0)
+            {
+                s_lo = dictMktData[p.SymbolName].Lows.LastValue;
+                s_hi = dictMktData[p.SymbolName].Highs.LastValue;
+                Print("SL: {0}\tLo: {1}\tHi: {2}\tVol Spread: {3}", p.StopLoss, s_lo, s_hi, s_hi - s_lo);
+                if (p.TradeType == TradeType.Buy && Math.Round(p.StopLoss.Value, s.Digits) < Math.Round(s_lo, s.Digits))
+                {
+                    p.ModifyStopLossPrice(s_lo);
+                }
+                else if (p.TradeType == TradeType.Sell && Math.Round(p.StopLoss.Value, s.Digits) > Math.Round(s_hi, s.Digits))
+                {
+                    p.ModifyStopLossPrice(s_hi);
+                }
             }
         }
 
@@ -188,20 +217,20 @@ namespace cAlgo.Robots
             var counter = Positions.FindAll(Label).Count();
             return counter;
         }
-        private double GetATR(Symbol s, TimeFrame tf, double ATR_Multiple)
+
+        private double GetSD(Symbol s, DataSeries d, int Periods, double Factor)
         {
-            double atr = Indicators.AverageTrueRange(MarketData.GetBars(tf, s.Name), 20, MovingAverageType.Simple).Result.LastValue;
-            return Math.Round(ATR_Multiple * atr / s.PipSize, 1);
+            double sd = Indicators.StandardDeviation(d, Periods, MovingAverageType.Simple).Result.LastValue;
+            return Math.Round(Factor * sd / s.PipSize, 1);
         }
 
-        private double GetOrderVolume(double StopLoss, double Risk, int NoOfTrades, Symbol sym)
+        private double GetOrderVolume(double StopLoss, double Risk, int NoOfTrades, Symbol s)
         {
-            double risk_tranche = Risk / NoOfTrades;
-            double _OrderVolume = ((Account.Balance * risk_tranche / 100) / StopLoss / sym.PipValue);
-            double FinalVolume = Math.Max(sym.VolumeInUnitsMin * 2, Math.Min(BadVolumeSize, _OrderVolume));
-            return sym.NormalizeVolumeInUnits(FinalVolume);
+            double risk_tranche = Risk * Math.Pow(0.9, NoOfTrades);
+            double _OrderVolume = ((Account.Balance * risk_tranche / 100) / StopLoss / s.PipValue);
+            double FinalVolume = Math.Max(s.VolumeInUnitsMin * 3, Math.Min(BadVolumeSize, _OrderVolume));
+            return s.NormalizeVolumeInUnits(FinalVolume);
         }
-
 
         void EquityAtRisk(Dictionary<string, double> Dict, string Key, Position p, Symbol s)
         {
@@ -223,7 +252,7 @@ namespace cAlgo.Robots
 
         void BreakevenTrade(Position p, double StartTrailing, double OriginalVolume)
         {
-            SL_pips = Math.Round(Math.Abs(p.EntryPrice - p.StopLoss.Value) / Asset.PipSize, 1);
+            SL_pips = StopLossPips(p, Asset);
             if (p.Pips > SL_pips && !p.HasTrailingStop && (p.VolumeInUnits != OriginalVolume || p.VolumeInUnits == Asset.VolumeInUnitsMin))
             {
                 Print("Start Trailing Position");
@@ -231,6 +260,7 @@ namespace cAlgo.Robots
                 if ((p.TradeType == TradeType.Buy && p.StopLoss < p.EntryPrice) || (p.TradeType == TradeType.Sell && p.EntryPrice < p.StopLoss))
                     p.ModifyStopLossPrice(p.EntryPrice);
             }
+
 
             BreakevenVolume = p.Pips / (p.Pips + SL_pips);
             double RiskOff = 1;
@@ -245,7 +275,9 @@ namespace cAlgo.Robots
 
         private void CloseHalf(Position p, Symbol s, double avgProfit, double OriginalVolume)
         {
-            if (p.NetProfit < -2 * avgProfit && p.VolumeInUnits == OriginalVolume)
+            double cutoff = avgProfit == 0.0 ? MaxLoss(p, Asset) : -1 * avgProfit;
+            Print("Position Cutoff: {0:F2}\tPnL: {1}", MaxLoss(p, Asset), p.NetProfit);
+            if (p.NetProfit < 0.5 * MaxLoss(p, Asset) && p.VolumeInUnits == OriginalVolume)
             {
                 Print("Trade MTM is -0.5R, closing half: {0}=={1}", p.Label, p.Comment);
                 p.ModifyVolume(s.NormalizeVolumeInUnits(p.VolumeInUnits * 0.5, RoundingMode.Down));
@@ -271,6 +303,18 @@ namespace cAlgo.Robots
                 }
         }
 
+        private double MaxLoss(Position position, Symbol symbol)
+        {
+            BuyOrSell = position.TradeType == TradeType.Buy ? 1 : -1;
+            double MaxLoss = BuyOrSell * ((position.StopLoss.Value - position.EntryPrice) / symbol.PipSize) * symbol.PipValue * position.VolumeInUnits;
+            return MaxLoss;
+        }
+
+        private double StopLossPips(Position position, Symbol symbol)
+        {
+            return Math.Round(Math.Abs(position.EntryPrice - position.StopLoss.Value) / symbol.PipSize, 1);
+        }
+
         private void FilterTrades(string Label)
         {
             Dictionary<int, double> Pid = new Dictionary<int, double>();
@@ -279,7 +323,7 @@ namespace cAlgo.Robots
 
             List<double> PnL = Pid.Values.ToList();
             PnL.Sort();
-            PnL.Reverse();
+            //PnL.Reverse();
             double Median = Find_Median(PnL);
             List<double> Median_list = PnL.Where(x => x > Median).ToList();
             double Q3 = Find_Median(Median_list);
@@ -309,11 +353,6 @@ namespace cAlgo.Robots
                 Final_Number = Value1;
             }
             return (double)(Final_Number);
-        }
-
-        private double WinRate()
-        {
-            return countWin / (countWin + countLoss);
         }
 
     }

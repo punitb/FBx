@@ -20,6 +20,15 @@ namespace cAlgo.Robots
         [Parameter("Label ID", DefaultValue = "DCT")]
         public string LabelPrefix { get; set; }
 
+        [Parameter("Trading TimeFrame", DefaultValue = "Hour")]
+        public TimeFrame tf { get; set; }
+
+        [Parameter("Swing Periods", DefaultValue = 10, Step = 1)]
+        public int SwingPeriods { get; set; }
+
+        [Parameter("Vol Periods", DefaultValue = 20, Step = 1)]
+        public int VolPeriods { get; set; }
+
         [Parameter("Risk Max (%)", DefaultValue = 1, Step = 0.05)]
         public double Risk_Max { get; set; }
 
@@ -30,7 +39,7 @@ namespace cAlgo.Robots
         public double RrRatio { get; set; }
 
         [Parameter("ATR Multiple", DefaultValue = 2, Step = 0.5)]
-        public double mATR { get; set; }
+        public double Factor { get; set; }
 
         [Parameter("Risk Cover (%)", DefaultValue = 50, Step = 5)]
         public double Risk_Cover { get; set; }
@@ -38,7 +47,7 @@ namespace cAlgo.Robots
         [Parameter("Debug Mode", DefaultValue = true)]
         public bool DebugMode { get; set; }
 
-        [Parameter("Token", DefaultValue = "___BOT_TOKEN___", Group = "Telegram")]
+        [Parameter("Token", DefaultValue = "1258254617:AAHgJTpoWsV7VEuunmp3DF8yGYX3hhgxbEA", Group = "Telegram")]
         public string Token { get; set; }
 
         [Parameter("Chat ID", DefaultValue = "-374452996", Group = "Telegram")]
@@ -52,7 +61,7 @@ namespace cAlgo.Robots
 
         public bool UseTrailingStop = false;
 
-        double StopLoss;
+        double StopLoss_Px, StopLoss_Pips;
         double BadVolumeSize = 10000;
 
         string _asset, _label;
@@ -78,13 +87,14 @@ namespace cAlgo.Robots
             Print("Bot started!");
             Balances = new ArrayList();
             //CalcStats();
-            Positions.Closed += OnPositionsClosed;
             dictEaR = new Dictionary<string, double>();
+
         }
 
-        void OnPositionsClosed(PositionClosedEventArgs obj)
+        protected override void OnBar()
         {
-            UpdateTradeStats(obj.Position);
+            if (Positions.FindAll(LabelPrefix).Count() > 0)
+                CalcStats();
         }
 
         protected override void OnStop()
@@ -97,6 +107,7 @@ namespace cAlgo.Robots
         {
             // If it's somehow null, message type isn't text and it's not the channel you wanted, dismiss the message.
             Print(e.Message.Text);
+
             if (e == null || e.Message.Type != MessageType.Text || e.Message.Chat.Id != Telegram.ChatId)
                 return;
 
@@ -118,10 +129,8 @@ namespace cAlgo.Robots
             if (Signal.GetUpperBound(0) < 6)
                 return;
 
-                        /*if (Signal[3].ToUpper() == "HOUR")
-                return;*/
 
-_asset = Signal[0];
+            _asset = Signal[0];
             _symbol = Symbols.GetSymbol(_asset);
 
             if (Signal.Last().ToUpper() == "UP")
@@ -134,43 +143,28 @@ _asset = Signal[0];
             }
 
             _label = string.Format("{0}", LabelPrefix);
-            double SD = StdDev(Signal[0], TimeFrame.Hour, 60);
-            double swing = LastSwing(TimeFrame.Minute15, _symbol, _direction, 5);
-            StopLoss = (swing + 1 * SD) / _symbol.PipSize;
-            //StopLoss = GetOrCalcStopLoss(_label, GetATR(_symbol, TimeFrame.Daily, mATR));
-            Print("StopLoss: {0}\tSwing: {1}\tSD: {2}", StopLoss, swing, SD);
+
+            Bars b = MarketData.GetBars(tf, _symbol.Name);
+            StopLoss_Px = StopLossPrice(b, _direction, SwingPeriods, Factor);
+            StopLoss_Pips = Math.Round(Math.Abs(b.ClosePrices.Last(0) - StopLoss_Px) / _symbol.PipSize, 1);
+            double SD = GetSD(_symbol, b.ClosePrices, VolPeriods, Factor);
+            Print("StopLoss: {0}\tSwing: {1}\tSD: {2}", StopLoss_Pips, StopLoss_Px, SD);
+
             double Risk = Signal[3].ToUpper() == "HOUR" ? Risk_Min : EquityOsc(Risk_Max, Risk_Min, EquityPeak, EquityTrough, Account.Equity - 1000);
-            _volume = GetOrderVolume(StopLoss, Risk, TradeCounter(_label, _asset), _symbol);
+            double ordervolume = GetOrderVolume(StopLoss_Pips, Risk, TradeCounter(_label, _asset), _symbol);
+            _volume = Signal[3].ToUpper() == "HOUR" ? _symbol.VolumeInUnitsMin * 3 : ordervolume;
             _comment = string.Format("{0}_{1}_{2}_{3}_{4}_{5}", TradeCounter(_label, _asset), _direction, Signal[3], Signal[0], Signal[6], _volume);
-            ExecuteMarketOrder(_direction, _symbol.Name, _volume, _label, StopLoss, null, _comment, UseTrailingStop);
-            Print("{0}: {1}", LastResult.Position.SymbolName, StopLoss);
+            ExecuteMarketOrder(_direction, _symbol.Name, _volume, _label, StopLoss_Pips, null, _comment, UseTrailingStop);
+            Position p = LastResult.Position;
+            Print("{5} == {4} {0}: SL:{1}, Risk:{2} Size:{3}", p.SymbolName, StopLoss_Pips, Risk, p.VolumeInUnits, p.TradeType, p.Id);
         }
 
 
-        private double LastSwing(TimeFrame tf, Symbol s, TradeType dir, int Periods)
+        private double StopLossPrice(Bars b, TradeType dir, int Periods, double Factor)
         {
-            Bars b = MarketData.GetBars(tf, s.Name);
-            Swing swing = Indicators.GetIndicator<Swing>(b, Periods, false, 20, true);
-            double lastswing = dir == TradeType.Buy ? swing.Lows.Last(0) : swing.Highs.Last(0);
-            return Math.Abs(b.ClosePrices.Last(0) - lastswing);
-        }
-
-        private double StdDev(string Asset, TimeFrame tf, int Periods)
-        {
-            StandardDeviation sd = Indicators.StandardDeviation(MarketData.GetBars(tf, Asset).ClosePrices, Periods, MovingAverageType.Simple);
-            double _stddev = sd.Result.LastValue;
-            return _stddev;
-        }
-
-        private void CheckSL(Position p)
-        {
-            if (!p.StopLoss.HasValue)
-            {
-                Print("No Stop Loss set. Setting to 2x Hourly SD");
-                Symbol s = Symbols.GetSymbol(p.SymbolName);
-                p.ModifyStopLossPips(StdDev(p.SymbolName, TimeFrame.Hour, 2) / s.PipSize);
-                return;
-            }
+            SwingSD swing_sd = Indicators.GetIndicator<SwingSD>(b, Periods, false, 20, Factor, false);
+            double lastswing = dir == TradeType.Buy ? swing_sd.Lows.Last(0) : swing_sd.Highs.Last(0);
+            return lastswing;
         }
 
         private void CalcStats()
@@ -183,6 +177,8 @@ _asset = Signal[0];
             EquityTrough = 0.0;
             double sumEq = 0.0;
             double prevBalance = 0;
+            double sum_sd = 0.0;
+            double sum_sortino_sd = 0.0;
             foreach (HistoricalTrade h in History.FindAll(LabelPrefix))
             {
                 if (h.NetProfit > 0)
@@ -200,8 +196,20 @@ _asset = Signal[0];
             EquityPeak = (double)Balances.ToArray().Max();
 
             Print("equity calcs");
-            for (var i = 1; i < 20; i++)
-                sumEq += (double)(Balances[Balances.Count - i]);
+            if (Balances.Count > 20)
+                for (var i = 1; i < 20; i++)
+                    sumEq += (double)(Balances[Balances.Count - i]);
+
+            double avgTotal = (avgProfit + avgLoss) / (countWin + countLoss);
+            foreach (HistoricalTrade h in History.FindAll(LabelPrefix))
+            {
+                sum_sd += Math.Pow(h.NetProfit - avgTotal, 2.0);
+                sum_sortino_sd += Math.Pow(Math.Max(h.NetProfit, 0) - avgTotal, 2.0);
+            }
+
+            double sd = Math.Sqrt(sum_sd / (countWin + countLoss));
+            double sortino_sd = Math.Sqrt(sum_sortino_sd / (countWin + countLoss));
+            double GE = (avgProfit * countWin + avgLoss * countLoss) / (countWin + countLoss);
 
             EquityTrough = sumEq / 20;
             avgProfit = Profits / countWin;
@@ -210,29 +218,11 @@ _asset = Signal[0];
             Print("Eq Trough: {0}", EquityTrough);
             Print("Eq prev Bal: {0}", prevBalance);
             Print("Sum Profits: {0}\tLosses: {1}", Profits, Losses);
-            Print("Counts Wins: {0}\tLosses: {1}", countWin, countLoss);
-        }
-
-        private void UpdateTradeStats(Position p)
-        {
-            if (p.Label == LabelPrefix)
-            {
-                if (p.NetProfit > 0)
-                {
-                    Profits += p.NetProfit;
-                    countWin++;
-                    avgProfit = Profits / countWin;
-                }
-                else if (p.NetProfit < 0)
-                {
-                    Losses += p.NetProfit;
-                    countLoss++;
-                    avgLoss = Losses / countLoss;
-                }
-
-                EquityPeak = Math.Max(Account.Equity + p.NetProfit, EquityPeak);
-                EquityTrough = Math.Min(Account.Equity + p.NetProfit, EquityTrough);
-            }
+            Print("Counts Wins: {0}\tLosses: {1}\tWin Rate: {2:P2}", countWin, countLoss, countWin / (countWin + countLoss));
+            Print("GE: {0}\tGPR: {1}", GE, Math.Abs(Profits / Losses));
+            Print("Vol: {0}\t-ve Vol: {1}", sd, sortino_sd);
+            Print("Sharpe: {0} Sortino: {1}", GE / sd, GE / sortino_sd);
+            Print("Score: {0}", (GE / sd) * (Profits / Losses));
         }
 
         public double EquityOsc(double Risk_Max, double Risk_Min, double Peak, double Trough, double equity)
@@ -277,14 +267,14 @@ _asset = Signal[0];
             return Math.Round(FinalStopLoss, 1);
         }
 
-        private double GetATR(Symbol s, TimeFrame tf, double mATR)
+        private double GetSD(Symbol s, DataSeries d, int Periods, double Factor)
         {
-            double atr = Indicators.AverageTrueRange(MarketData.GetBars(tf, s.Name), 20, MovingAverageType.Simple).Result.LastValue;
-            return Math.Round(mATR * atr / s.PipSize, 1);
+            double sd = Indicators.StandardDeviation(d, Periods, MovingAverageType.Simple).Result.LastValue;
+            return Math.Round(Factor * sd / s.PipSize, 1);
         }
         private double GetOrderVolume(double StopLoss, double Risk, int NoOfTrades, Symbol s)
         {
-            double risk_tranche = Risk * (100 - NoOfTrades) / NoOfTrades;
+            double risk_tranche = Risk * Math.Pow(0.9, NoOfTrades);
             double _OrderVolume = ((Account.Balance * risk_tranche / 100) / StopLoss / s.PipValue);
             double FinalVolume = Math.Max(s.VolumeInUnitsMin * 3, Math.Min(BadVolumeSize, _OrderVolume));
             return s.NormalizeVolumeInUnits(FinalVolume);
@@ -292,3 +282,5 @@ _asset = Signal[0];
 
     }
 }
+
+
